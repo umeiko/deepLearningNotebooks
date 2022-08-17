@@ -4,7 +4,7 @@
 import collections
 import re
 
-def read_time_machine(path:str="/home/mzy/WorkSpace/github_projects/data_set/H_G_Well_time_machine.txt")->list:
+def read_time_machine(path:str="./data_set/H_G_Well_time_machine.txt")->list:
     """从文件中读取'时光机器'数据集, 并按行隔开"""
     with open(path, "r") as f:
         lines = f.readlines()

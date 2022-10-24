@@ -4,6 +4,9 @@
 import collections
 import random
 import re
+import time
+import torch
+from torch import nn
 from typing import Union
 
 def read_time_machine(path:str="./data_set/H_G_Well_time_machine.txt")->list:
@@ -121,7 +124,8 @@ def seq_data_iter_random(corpus:list, batch_size:int, num_steps:int, drop_last:b
     init_indices = [i * (num_steps) for i in range(num_samples+1)]
     # 打乱索引
     random.shuffle(init_indices)
-    out_x, out_y = [], []
+    out_x:list = []
+    out_y:list = []
     for k, i in enumerate(init_indices):
         temp_x = corpus[i:i+num_steps]
         temp_y = corpus[i+1:i+num_steps+1]
@@ -177,3 +181,35 @@ def load_data_time_machine(batch_size:int, num_steps:int,
     data_iter = SeqDataLoaderTimeMachine(
         batch_size, num_steps, use_random_iter, max_tokens, token_type)
     return data_iter, data_iter.vocab
+
+class Timer():
+    """简易计时器"""
+    def __init__(self):
+        self.start_time = time.time()
+    def stop(self)-> float:
+        return time.time() - self.start_time
+
+def grad_clipping(net:nn.Module, theta:float):
+    """梯度裁剪"""
+    params = [p for p in net.parameters() if p.requires_grad]
+    # 计算 ||g||
+    norm = torch.sqrt( sum(torch.sum(p.grad ** 2) for p in params) )
+    if norm > theta:
+        for param in params:
+            param.grad[:] *= theta / norm
+
+def rnn_predict(prefix, num_preds:int, net, vocab:Vocab, device:str):
+    """通过序列模型, 续写一段文字"""
+    state     = net.begin_state(batch_size=1, device=device)
+    outputs   = [vocab[prefix[0]]]
+    # 每次以输出序列的最后一个字符作为输入
+    get_input = lambda: torch.tensor([outputs[-1]], device=device).reshape((1,1))
+    # 这个阶段作为预热阶段
+    for y in prefix[1:]:
+        _, state = net(get_input(), state)
+        outputs.append(vocab[y])
+    # 这个阶段为预测阶段
+    for _ in range(num_preds):
+        y, state = net(get_input(), state)
+        outputs.append(int(y.argmax(dim=1).reshape(1)))
+    return ''.join([vocab.idx_to_token[i] for i in outputs])

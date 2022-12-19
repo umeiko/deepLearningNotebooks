@@ -7,7 +7,14 @@ import re
 import time
 import torch
 from torch import nn
-from typing import Union
+from torch.nn import functional as F
+from typing import Union, Callable
+
+
+forward_ = Callable[[torch.Tensor, torch.Tensor, list], tuple]
+state_   = Callable[[int, int, str], torch.Tensor]
+loss_    = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+param_   = Callable[[int, int, str], list]
 
 def read_time_machine(path:str="./data_set/H_G_Well_time_machine.txt")->list:
     """从文件中读取'时光机器'数据集, 并按行隔开"""
@@ -196,10 +203,11 @@ def grad_clipping(net:nn.Module, theta:float):
     norm = torch.sqrt( sum(torch.sum(p.grad ** 2) for p in params) )
     if norm > theta:
         for param in params:
-            param.grad[:] *= theta / norm
+            param.grad[:] *= theta / norm     
 
-def rnn_predict(prefix, num_preds:int, net, vocab:Vocab, device:str):
+def rnn_predict(prefix:str, num_preds:int, net, vocab:Vocab,  device:str, add_blank=False):
     """通过序列模型, 续写一段文字"""
+    prefix    = prefix.split() if add_blank else prefix
     state     = net.begin_state(batch_size=1, device=device)
     outputs   = [vocab[prefix[0]]]
     # 每次以输出序列的最后一个字符作为输入
@@ -211,5 +219,82 @@ def rnn_predict(prefix, num_preds:int, net, vocab:Vocab, device:str):
     # 这个阶段为预测阶段
     for _ in range(num_preds):
         y, state = net(get_input(), state)
-        outputs.append(int(y.argmax(dim=1).reshape(1)))
-    return ''.join([vocab.idx_to_token[i] for i in outputs])
+        outputs.append(int(y.argmax(dim=-1).reshape(1)))
+    blank = " " if add_blank else ""
+    return ''.join([vocab.idx_to_token[i]+blank for i in outputs])
+
+class RNN(nn.Module):
+    """循环神经网络的自己实现"""
+    def __init__(self, vocab_size:int, num_hiddens:int, device:str, 
+                    get_params:param_, init_state:state_, 
+                    forward_fn:forward_) -> None:
+        super().__init__()
+        self.vocab_size, self.num_hiddens = vocab_size, num_hiddens
+        self.params = get_params(vocab_size, num_hiddens, device)
+        self.init_state, self.forward_fn = init_state, forward_fn
+    
+    def forward(self, x:torch.Tensor, state:torch.Tensor):
+        x = F.one_hot(x.T, self.vocab_size).to(torch.float32)
+        return self.forward_fn(x, state, self.params)
+        
+    def begin_state(self, batch_size:int, device:str):
+        return self.init_state(batch_size, self.num_hiddens, device)
+    
+    def parameters(self, recurse: bool = True):
+        for param in self.params:
+            yield param
+
+    def __repr__(self) -> str:
+        out = f"<RNN_Module with {self.num_hiddens} hiddens>"
+        return out
+
+
+def train_rnn_one_epoch(net:RNN, train_iter:SeqDataLoaderTimeMachine, 
+                        loss:loss_, opt:torch.optim.Optimizer,
+                        device:str, use_random_iter:bool):
+    """返回结果:困惑度, 训练速度 (词元/秒) """
+    state = None
+    loss_count, num_tokens = 0, 0
+    timer = Timer()
+    for x, y in train_iter:
+        # 转置后展平，标签数据按照时序排列
+        y = torch.tensor(y).T.reshape(-1)
+        x, y = torch.tensor(x).to(device), y.to(device)
+        # 需要初始化隐变量的情况
+        if state is None or use_random_iter:
+            # 如果使用随机抽样方法，则每个minibatch都重新初始化state
+            state = net.begin_state(x.shape[0], device)
+        else:
+            state = state.detach()
+        y_hat, state = net(x, state)
+        l = loss(y_hat, y.to(torch.long)).mean()
+        # 更新梯度
+        opt.zero_grad()
+        l.backward()
+        grad_clipping(net, 1.)
+        opt.step()
+        # .numel() 返回张量中的所有参数数量
+        loss_count += l * y.numel()
+        num_tokens += y.numel()
+    with torch.no_grad():
+        return torch.exp(loss_count / num_tokens), num_tokens / timer.stop()
+
+def train_rnn(net:RNN, num_epochs, train_iter, opt:torch.optim.Optimizer, device, tqdm=None):
+    """训练循环神经网络"""
+    loss = nn.CrossEntropyLoss()
+    net.train()
+    ppl_ = []
+
+    if tqdm is not None:
+        iter_ = tqdm(range(num_epochs))
+    else:
+        iter_ = range(num_epochs)
+
+    for epo in iter_:
+        ppl, speed = train_rnn_one_epoch(
+            net, train_iter, loss, opt, device, True)
+        if (epo + 1) % 10 == 0:
+            ppl_.append(float(ppl))
+
+    print(f'困惑度[{ppl:.2f}], 速度[{speed:.1f} 词元/秒], 设备[{str(device)}]')
+    return ppl_

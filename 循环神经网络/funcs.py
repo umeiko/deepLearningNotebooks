@@ -248,17 +248,46 @@ class RNN(nn.Module):
         out = f"<RNN_Module with {self.num_hiddens} hiddens>"
         return out
 
+class RNN_(nn.Module):
+    """利用高级API的实现"""
+    def __init__(self, layer:nn.RNN, device="cuda:1", batch_first=True):
+        super().__init__()
+        self.batch_first = batch_first
+        self.device = device
+        self.layer = layer
+        self.out_layer = nn.Linear(layer.hidden_size, layer.input_size, device=device)
+    
+    def forward(self, x:torch.Tensor, state:torch.Tensor):
+        x = x.long().to(self.device)
+        if self.batch_first:
+            x = F.one_hot(x, self.layer.input_size).to(torch.float)
+        else:
+            x = F.one_hot(x.T, self.layer.input_size).to(torch.float)
+        y, state = self.layer(x, state)
+        # y:[t,b,embed]  ->  [t*b, embed]
+        out = self.out_layer(y.reshape((-1, self.layer.hidden_size)))
+        return out, state
+    
+    def begin_state(self, batch_size:int, device:str):
+        return torch.zeros((1, batch_size, self.layer.hidden_size), 
+                            dtype=torch.float, device=device)
+        
+
 
 def train_rnn_one_epoch(net:RNN, train_iter:SeqDataLoaderTimeMachine, 
                         loss:loss_, opt:torch.optim.Optimizer,
-                        device:str, use_random_iter:bool):
+                        device:str, use_random_iter:bool, batch_first=False):
     """返回结果:困惑度, 训练速度 (词元/秒) """
     state = None
     loss_count, num_tokens = 0, 0
     timer = Timer()
     for x, y in train_iter:
-        # 转置后展平，标签数据按照时序排列
-        y = torch.tensor(y).T.reshape(-1)
+        if not batch_first:
+            # 转置后展平，标签数据按照时序排列
+            y = torch.tensor(y).T.reshape(-1)
+        else:
+            # 【这里y不转置，直接按照批次排序】
+            y = torch.tensor(y).reshape(-1)
         x, y = torch.tensor(x).to(device), y.to(device)
         # 需要初始化隐变量的情况
         if state is None or use_random_iter:
@@ -279,7 +308,10 @@ def train_rnn_one_epoch(net:RNN, train_iter:SeqDataLoaderTimeMachine,
     with torch.no_grad():
         return torch.exp(loss_count / num_tokens), num_tokens / timer.stop()
 
-def train_rnn(net:RNN, num_epochs, train_iter, opt:torch.optim.Optimizer, device, tqdm=None):
+
+
+
+def train_rnn(net:RNN, num_epochs, train_iter, opt:torch.optim.Optimizer, device, tqdm=None, batch_first=False):
     """训练循环神经网络"""
     loss = nn.CrossEntropyLoss()
     net.train()
@@ -292,7 +324,7 @@ def train_rnn(net:RNN, num_epochs, train_iter, opt:torch.optim.Optimizer, device
 
     for epo in iter_:
         ppl, speed = train_rnn_one_epoch(
-            net, train_iter, loss, opt, device, True)
+            net, train_iter, loss, opt, device, True, batch_first)
         if (epo + 1) % 10 == 0:
             ppl_.append(float(ppl))
 

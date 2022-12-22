@@ -245,8 +245,7 @@ class RNN(nn.Module):
             yield param
 
     def __repr__(self) -> str:
-        out = f"<RNN_Module with {self.num_hiddens} hiddens>"
-        return out
+        return f"<RNN_Module with {self.num_hiddens} hiddens>"
 
 class RNN_(nn.Module):
     """利用高级API的实现"""
@@ -294,7 +293,7 @@ def train_rnn_one_epoch(net:RNN, train_iter:SeqDataLoaderTimeMachine,
             # 如果使用随机抽样方法，则每个minibatch都重新初始化state
             state = net.begin_state(x.shape[0], device)
         else:
-            state = state.detach()
+            state = state_.detach()
         y_hat, state = net(x, state)
         l = loss(y_hat, y.to(torch.long)).mean()
         # 更新梯度

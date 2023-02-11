@@ -16,6 +16,18 @@ state_   = Callable[[int, int, str], torch.Tensor]
 loss_    = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 param_   = Callable[[int, int, str], list]
 
+class tqdmEnumerate():
+    """兼容tqdm的enumerate模块"""
+    def __init__(self, it, start:int = 0) -> None:
+        self.enum = enumerate(it, start)
+        self.it = it
+    def __len__(self):
+        return len(self.it)
+    def __next__(self):
+        return self.enum.__next__()
+    def __iter__(self):
+        return self.enum.__iter__()
+
 def read_time_machine(path:str="./data_set/H_G_Well_time_machine.txt")->list:
     """从文件中读取'时光机器'数据集, 并按行隔开"""
     with open(path, "r") as f:
@@ -254,7 +266,13 @@ class RNN_(nn.Module):
         self.batch_first = batch_first
         self.device = device
         self.layer = layer
-        self.out_layer = nn.Linear(layer.hidden_size, layer.input_size, device=device)
+        self.num_layers = layer.num_layers
+        self.num_hiddens = layer.hidden_size
+        # 处理模型为双向模型时的问题
+        if not self.layer.bidirectional:
+            self.out_layer = nn.Linear(layer.hidden_size, layer.input_size, device=device)
+        else:
+            self.out_layer = nn.Linear(layer.hidden_size*2, layer.input_size, device=device)
     
     def forward(self, x:torch.Tensor, state:torch.Tensor):
         x = x.long().to(self.device)
@@ -264,11 +282,16 @@ class RNN_(nn.Module):
             x = F.one_hot(x.T, self.layer.input_size).to(torch.float)
         y, state = self.layer(x, state)
         # y:[t,b,embed]  ->  [t*b, embed]
-        out = self.out_layer(y.reshape((-1, self.layer.hidden_size)))
+        out = self.out_layer(y.reshape((-1, y.shape[-1])))
         return out, state
     
     def begin_state(self, batch_size:int, device:str):
-        return torch.zeros((1, batch_size, self.layer.hidden_size), 
+        num_layers = self.num_layers if not self.layer.bidirectional else (self.num_layers * 2)
+        if isinstance(self.layer, nn.LSTM):
+            return (torch.zeros((num_layers, batch_size, self.num_hiddens), device=device),
+            torch.zeros((num_layers, batch_size, self.num_hiddens), device=device))
+        else:
+            return torch.zeros((num_layers, batch_size, self.layer.hidden_size), 
                             dtype=torch.float, device=device)
         
 
@@ -306,9 +329,6 @@ def train_rnn_one_epoch(net:RNN, train_iter:SeqDataLoaderTimeMachine,
         num_tokens += y.numel()
     with torch.no_grad():
         return torch.exp(loss_count / num_tokens), num_tokens / timer.stop()
-
-
-
 
 def train_rnn(net:RNN, num_epochs, train_iter, opt:torch.optim.Optimizer, device, tqdm=None, batch_first=False):
     """训练循环神经网络"""

@@ -1,6 +1,7 @@
 """
 将自然语言处理的一些常用函数及类进行了打包
 """
+import os
 import collections
 import random
 import re
@@ -8,8 +9,9 @@ import time
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.utils.data import TensorDataset, DataLoader
 from typing import Union, Callable
-
+from tqdm.notebook import tqdm
 
 forward_ = Callable[[torch.Tensor, torch.Tensor, list], tuple]
 state_   = Callable[[int, int, str], torch.Tensor]
@@ -50,8 +52,59 @@ def tokenize(lines:list, token='word'):
     else:
         print('错误：未知词元类型：' + token)
 
+def read_data_nmt(data_path="./data_set/fra-eng/"):
+    """载入“英语－法语”数据集"""
+    with open(os.path.join(data_path, 'fra.txt'), 'r',
+             encoding='utf-8') as f:
+        return f.read()
+
+def tokenize_nmt(text:str, num_examples=None):
+    """词元化“英语－法语”数据数据集"""
+    source, target = [], []
+    for k, line in enumerate(text.split('\n')):
+        if (num_examples is not None) and (k > num_examples):
+            break
+        pair = line.split('\t')
+        if len(pair) == 2:
+            source.append(pair[0].split(" "))
+            target.append(pair[1].split(" "))
+    return source, target
+
+def preprocess_nmt(text:str):
+    """文本预处理"""
+    # 替换空白字符为普通空格，并转为全小写
+    text = text.replace('\u202f', ' ').replace('\xa0', ' ').lower()
+    def no_space(char, prev_char):
+        return char in set(',.!?') and prev_char != ' '
+    out = [" " + char if k>0 and no_space(char, text[k-1]) else char for k, char in enumerate(tqdm(text))]
+    return "".join(out)
+
+def truncate_pad(line:list[int], num_steps:int, padding_token:list[int]):
+    """截断或填充文本序列
+    
+    输入参数
+    ----------
+    `line`     : 输入的句子
+    `num_steps`: 需要调整到的长度
+    `padding_token` : 长度不足时使用的填充词元
+    """
+    if len(line) > num_steps:
+        return line[:num_steps]
+    else:
+        return line + [padding_token] * (num_steps - len(line))
+
+
 class Vocab:
-    """一个词元字典类的实现"""
+    """
+    一个词元字典类的实现，会根据输入数据序列，统计出现词元的频率，并将词元安装词频进行排列.
+    提供了词元的embedding方法，可以将词元编码为整数，或通过整数索引到某个词元。
+    
+    构造参数
+    ----------
+        `tokens`   : 包含词元的句子或其它形式的序列
+        `min_freq` : 过滤掉出现频率低于该数量的词元
+        `reserved_tokens` : 预设保留词元的序列
+    """
     def __init__(self, tokens:list, min_freq=0, reserved_tokens:list=None) -> None:
         if tokens is not None:
             # 当第一个条件满足时，就不会跳到第二个判断，避免了空列表报错的情况。
@@ -103,6 +156,39 @@ class Vocab:
             return [self.to_tokens(keys) for keys in input_keys]
         else:
             return self.idx_to_token[0]
+
+def build_array_nmt(lines:list, vocab:Vocab, num_steps:int):
+    """将文本序列转换为小批量
+
+    在每个句子句尾添加`<eos>`标识。
+    将句子截断或填充到指定长度。
+    转化为张量输出。
+    """
+    lines = [vocab[l] for l in lines]
+    lines = [l + [vocab['<eos>']] for l in lines]
+    array = torch.tensor(
+        [truncate_pad(l, num_steps, vocab["<pad>"]) for l in lines]
+        )
+    valid_len = (array != vocab["<pad>"]).to(torch.int32).sum(1)
+    return array, valid_len
+
+def load_data_nmt(batch_size:int, num_steps:int, num_examples=600):
+    """返回翻译数据集迭代器及词表
+    
+    """
+    text = preprocess_nmt(read_data_nmt())
+    source, target = tokenize_nmt(text, num_examples)
+    reserved_tokens = ['<pad>', "<bos>", "<eos>"]
+    src_vocab = Vocab(source, 2, reserved_tokens)
+    tgt_vocab = Vocab(target, 2, reserved_tokens)
+    src_array, src_valid_len = build_array_nmt(source, src_vocab, num_steps)
+    tgt_array, tgt_valid_len = build_array_nmt(target, tgt_vocab, num_steps)
+    data_arrays = (src_array, src_valid_len, tgt_array, tgt_valid_len)
+    
+    dataset = TensorDataset(*data_arrays)
+    data_iter = DataLoader(dataset, batch_size, shuffle=True)
+    return data_iter, src_vocab, tgt_vocab
+
 
 def seq_data_iter_sequential(corpus:list, batch_size:int, num_steps:int, drop_last:bool=True):
     """ 实现顺序分区策略 """
@@ -202,11 +288,26 @@ def load_data_time_machine(batch_size:int, num_steps:int,
     return data_iter, data_iter.vocab
 
 class Timer():
-    """简易计时器"""
+    """简易计时器
+    初始化后即开始计时
+    `Timer.stop()`: 停止计时并返回计时时间
+    """
     def __init__(self):
         self.start_time = time.time()
     def stop(self)-> float:
         return time.time() - self.start_time
+
+class Accumulator():
+    """参数计数器"""
+    def __init__(self, item_count:int):
+        self.lst = [ 0 for _ in range(item_count)]
+    def add(self, *args):
+        if len(args) > len(self.lst):
+            raise Exception("The input item count should not exceed the defined item count.")
+        for k, i in enumerate(args):
+            self.lst[k] += i
+    def __getitem__(self, idx):
+        return self.lst[idx]
 
 def grad_clipping(net:nn.Module, theta:float):
     """梯度裁剪"""
@@ -293,8 +394,7 @@ class RNN_(nn.Module):
         else:
             return torch.zeros((num_layers, batch_size, self.layer.hidden_size), 
                             dtype=torch.float, device=device)
-        
-
+    
 
 def train_rnn_one_epoch(net:RNN, train_iter:SeqDataLoaderTimeMachine, 
                         loss:loss_, opt:torch.optim.Optimizer,
@@ -349,3 +449,35 @@ def train_rnn(net:RNN, num_epochs, train_iter, opt:torch.optim.Optimizer, device
 
     print(f'困惑度[{ppl:.2f}], 速度[{speed:.1f} 词元/秒], 设备[{str(device)}]')
     return ppl_
+
+
+class Encoder(nn.Module):
+    """编码器-解码器架构的基本编码器接口"""
+    def __init__(self, **kwargs):
+        super(Encoder, self).__init__(**kwargs)
+
+    def forward(self, X, *args):
+        raise NotImplementedError
+
+class Decoder(nn.Module):
+    """编码器-解码器架构的基本解码器接口"""
+    def __init__(self, **kwargs):
+        super(Decoder, self).__init__(**kwargs)
+
+    def init_state(self, enc_outputs, *args) -> torch.Tensor:
+        raise NotImplementedError
+
+    def forward(self, X, state) -> tuple[torch.Tensor, torch.Tensor]:
+        raise NotImplementedError
+
+class EncoderDecoder(nn.Module):
+    """编码器-解码器架构的基类"""
+    def __init__(self, encoder:Encoder, decoder:Decoder, **kwargs):
+        super(EncoderDecoder, self).__init__(**kwargs)
+        self.encoder = encoder
+        self.decoder = decoder
+
+    def forward(self, enc_X, dec_X, *args):
+        enc_outputs = self.encoder(enc_X, *args)
+        dec_state = self.decoder.init_state(enc_outputs, *args)
+        return self.decoder(dec_X, dec_state)
